@@ -33,21 +33,26 @@ enum {
  DOUBLEWORDTEST1,//W40015 DW R12
  //W40016
  PASSDIRECTION,//W40017 W R13 0=left pass 1=right pass
- GOTOSTART,
+ GOTOSTART,//W40018 R14 0=not ready 1=ready to pass left 2=ready to pass right
  //WRITE PACKET 2
- LEADSCREWPOS,//W40101 DW R14
+ LEADSCREWPOS,//W40101 DW R15
  //W40102
- SPINDLE_DEG,//W40103 W R15
- SPINDLE_RPM,//W40104 W R16
- DRIVEJOG,//W40105 W R17 (0=speed setting 1)(1=speed setting 2)(2=speed setting 3) (3=Speed setting 4)(4= RUN left)(5= RUN right)(6=STOP)(7=HMI CONTROL)
- total_packets,//W40106 W R18
- total_failed,//W40107 W R19
- total_requests,//W40108 W R20
- transfer_rate,//W40109 W R21
- transfer_delay,//W40110 W R22
- DOUBLEWORDTEST2,//W40111 DW R23
- PASSCOMPLETE,//W40112 W R24
- ALARM,//W40113
+ SPINDLE_DEG,//W40103 W R16
+ SPINDLE_RPM,//W40104 W R17
+ DRIVEJOG,//W40106 W R18 (0=speed setting 1)(1=speed setting 2)(2=speed setting 3) (3=Speed setting 4)(4= RUN left)(5= RUN right)(6=STOP)(7=HMI CONTROL)
+ total_packets,//W40107 W R19
+ total_failed,//W40108 W R20
+ total_requests,//W40109 W R21
+ transfer_rate,//W40110 W R22
+ transfer_delay,//W40111 W R23
+ DOUBLEWORDTEST2,//W40112 DW R24
+ PASSCOMPLETE,//W40113 W R25
+ ALARM,//W40114 W R26
+ TOOLPOSITION,//W40115 DW R27
+ LEFTMAXWRITE,//W40117 DW R28
+ RIGHTMAXWRITE,//W40119 DW R29
+ INPOSITION, // W40121 W R30 0 = not in position 1 in position left 2 in pos right
+ PASSNUMBER,//W40122 w R31
   TOTAL_REGS //=25 (double words covers two addresses)
 };
 
@@ -90,17 +95,17 @@ Modbus master;
   const int SPEncoderZ = 20;//Spindle encoder Z pulse (1ppr)
   
 //DR-Drive Encoder Input
-  const int DREncoderA = 19;//Servo Drive feedback encoder (2500ppr)
-  const int DREncoderB = 47;//Servo Drive feedback encoder (2500ppr)
+  const int DREncoderA = 3;//Servo Drive feedback encoder (2500ppr)
+  const int DREncoderB = 50;//Servo Drive feedback encoder (2500ppr)
 
 //Control-Box input
-  const int DriveLeft = 46; //Jog left,run pass in feed mode, start threading in threading mode/or if reverse threadng return to start.
-  const int DriveRight = 45; //Jog right, run pass in feed mode, return to start in threading mode/or if reverse threading start threading.
+  const int DriveLeft = 48; //Jog left,run pass in feed mode, start threading in threading mode/or if reverse threadng return to start.
+  const int DriveRight = 49; //Jog right, run pass in feed mode, return to start in threading mode/or if reverse threading start threading.
   int DriveLeftState = LOW;
   int DriveRightState = LOW;
   
 //Spindle positioning and timing
-  int SpindleRPM;
+  long SpindleRPM;
   int SPEncoderAstate;
   int SPEncoderBstate;
   int SPEncoderZstate;
@@ -111,6 +116,7 @@ Modbus master;
   long SPETimeA; //micros at A state change
   long SPETimeB; //micros at B state change
   int SpindlePositionABS;
+  long SpindlePositionABS100;
 
 // Lead screw Drive positioning
   int DREncoderAstate;
@@ -119,12 +125,13 @@ Modbus master;
   int DREncoderBlaststate;
   long DriveCurrentPos;
   int BackLash;
+  int BackLash2;
   long LeadScrewCurrentPos;
   long LeadScrewLeft;
   long LeadScrewLeftMAX;
   long LeadScrewRight;
   long LeadScrewRightMAX;
-  long LeadScrewReturnToLead; // new postion to allow for correct tool pressure during threading, = leadscrewreturnto + toolanglelead
+  long LeadScrewReturnToLead;
   int SquareWaveHILO; //Time for square wave of step
   int SquareWave; //Half square wave time
   long PreviousMicros;
@@ -137,7 +144,6 @@ Modbus master;
   int RunDirection; //Run Direction of operation0=forward 1=reverse, this will allow for rapid return to start pos
   int PassNumber; //passes done
   int FeedMode; //0-threads 1-feed
-  int ToolAngleLead; //Amount to advance tool before each cut to keep cutting on front of tool (only applies to threading)
   long sppsr; //step pulses per spindle revolution
 
 //prog ints
@@ -174,17 +180,17 @@ void setup() {
 // Servo control set up  
   pinMode (StepPulse, OUTPUT);
   pinMode (DirPulse, OUTPUT);
-  pinMode (SPEncoderA, INPUT);
-  pinMode (SPEncoderB, INPUT);
-  pinMode (SPEncoderZ, INPUT);
-  pinMode (DREncoderA, INPUT);
-  pinMode (DREncoderB, INPUT);
-  pinMode (DriveLeft, INPUT);
-  pinMode (DriveRight, INPUT);
+  pinMode (SPEncoderA, INPUT_PULLUP);
+  pinMode (SPEncoderB, INPUT_PULLUP);
+  pinMode (SPEncoderZ, INPUT_PULLUP);
+  pinMode (DREncoderA, INPUT_PULLUP);
+  pinMode (DREncoderB, INPUT_PULLUP);
+  pinMode (DriveLeft, INPUT_PULLUP);
+  pinMode (DriveRight, INPUT_PULLUP);
 
-  attachInterrupt(digitalPinToInterrupt(SPEncoderAstate), SPINDLE_TIME, HIGH);
-  attachInterrupt(digitalPinToInterrupt(SPEncoderZstate), SPINDLE_ZERO, HIGH);
-  attachInterrupt(digitalPinToInterrupt(DREncoderAstate), DRIVE_POS, HIGH);
+  attachInterrupt(digitalPinToInterrupt(SPEncoderAstate), SPINDLE_TIME, RISING);
+  attachInterrupt(digitalPinToInterrupt(SPEncoderZstate), SPINDLE_ZERO, RISING);
+  attachInterrupt(digitalPinToInterrupt(DREncoderAstate), DRIVE_POS, RISING);
 
 // RS 485 SetUp
 
@@ -194,12 +200,15 @@ void setup() {
   //Config individual packet: (packet, ID, Function, Address, Number of register or data, start register in master register array)
   master.construct(&packets[PACKET1], hmiID, READ_HOLDING_REGISTERS, 0, 14, 0);
 
-  master.construct(&packets[PACKET2], hmiID, PRESET_MULTIPLE_REGISTERS, 100, 12, 14);
+  master.construct(&packets[PACKET2], hmiID, PRESET_MULTIPLE_REGISTERS, 100, 17, 14);
 
   //Start Modbus
   master.begin(&Serial, BAUD, BYTE_FORMAT, TIMEOUT, POLLING, RETRIES, TxEnablePin);
 
 
+  Serial.begin(57600);  //debug on serial0
+
+  println("Arduino Modbus Master");
 
 }
 
@@ -207,10 +216,8 @@ void loop() {
   SquareWaveHILO = SpindleMicros/sppsr;
   SquareWave = SquareWaveHILO/2;
 //Backlash correction
-  if(LSDIR==HIGH){
-   LeadScrewCurrentPos = DriveCurrentPos + BackLash;  
-  }else{LeadScrewCurrentPos = DriveCurrentPos - BackLash;}
-    
+   LeadScrewCurrentPos = DriveCurrentPos;
+   println(SpindlePositionABS); 
 
    //RUN ServoLEFT
  if (RUN_SERVOL == HIGH){
@@ -239,9 +246,11 @@ digitalWrite(INPOSITIONR, LOW);
 digitalWrite(INPOSITIONL, LOW);
 regs[READYFORPASS] = 0;
 regs[PASSCOMPLETE] = 0;
+regs[INPOSITION] = 0;
 digitalWrite(JOG_L, HIGH);
 digitalWrite(JOG_R, HIGH);
 digitalWrite(RUN_COMS, HIGH);
+regs[PASSNUMBER]++;
 digitalWrite(PassComplete, LOW);   
 }
 
@@ -249,10 +258,18 @@ void PROG_SEL(){
   DoubleWordTestHolder = regs[DOUBLEWORDTEST1];
   regs[DOUBLEWORDTEST2] = DoubleWordTestHolder + 5;
   SpindleRPM = 60000000 / SpindleMicros;
-  regs[SPINDLE_RPM] = SpindleRPM;
+  SpindlePositionABS100 = SpindlePositionABS * 100;
+  BackLash2 = BackLash * 2;
   //JOG/RUN button inputs
   DriveLeftState = digitalRead(DriveLeft);
   DriveRightState = digitalRead(DriveRight);
+  if(regs[HOMESETZERO]==1){
+    DriveCurrentPos = 0;
+  }
+  if(regs[SETSPINDLEZERO]==1){
+  SpindlePositionABS = 0;
+  }
+  //Start pos
 
   if(regs[SETUPCOMPLETE]==0){
     if(DriveLeftState==HIGH){
@@ -270,13 +287,15 @@ void PROG_SEL(){
     if(DriveLeftState == HIGH){
       digitalWrite(RUNTOSTART, HIGH);
     }
-   if(DriveRightState == HIGH){
+    if(regs[READYFORPASS]==2){
+    if(DriveRightState == HIGH){
     if(INPOSITIONR == HIGH){
    digitalWrite(RUN_COMS, LOW);
    digitalWrite(JOG_L, LOW);
    digitalWrite(JOG_R, LOW);
    digitalWrite(READY_FOR_PASSR, HIGH);
-     }else{regs[ALARM]=2;} // NOT IN POSTION ALARM
+      }else{regs[ALARM]=2;} // NOT IN POSTION ALARM
+     }
     }
    }
    
@@ -284,13 +303,15 @@ void PROG_SEL(){
     if(DriveRightState == HIGH){
       digitalWrite(RUNTOSTART, HIGH);
     }
-   if(DriveLeftState == HIGH){
+    if(regs[READYFORPASS]==1){
+    if(DriveLeftState == HIGH){
     if(INPOSITIONL == HIGH){
    digitalWrite(RUN_COMS, LOW);
    digitalWrite(JOG_L, LOW);
    digitalWrite(JOG_R, LOW);
    digitalWrite(READY_FOR_PASSL, HIGH);
-     }else{regs[ALARM]=1;} // NOT IN POSTION ALARM
+      }else{regs[ALARM]=1;} // NOT IN POSTION ALARM
+     }
     }
    }
     
@@ -342,16 +363,14 @@ void DRIVE_POS(){
   DREncoderBstate = digitalRead(DREncoderB);
     if (DREncoderAstate != DREncoderBstate){
         DriveCurrentPos++;
-        digitalWrite(LSDIR, LOW);//Store Lead Screw DIRection for backlash
       }else{
         DriveCurrentPos--;
-        digitalWrite(LSDIR, HIGH);//Store Lead Screw DIRection for backlash
       }  
 }
     
 void SERVOPULSEFWD(){
 digitalWrite(DirPulse, HIGH);
- if(LeadScrewLeftMAX >= LeadScrewCurrentPos){
+ if(LeadScrewLeftMAX > LeadScrewCurrentPos){
  if(PassComplete == LOW){
   if(micros() - PreviousMicros >= SquareWave) {
     PreviousMicros = micros();
@@ -370,7 +389,7 @@ if(LeadScrewLeftMAX <= LeadScrewCurrentPos){
 }
 void SERVOPULSERVS(){
 digitalWrite(DirPulse, LOW);
- if(LeadScrewRightMAX <= LeadScrewCurrentPos){
+ if(LeadScrewRightMAX < LeadScrewCurrentPos){
  if(PassComplete == LOW){
   if(micros() - PreviousMicros >= SquareWave) {
     PreviousMicros = micros();
@@ -394,7 +413,7 @@ void JOG_LEFT(){
   Millis1 = millis();
   }
     if(Millis - Millis1 < 800){
-    regs[DRIVEJOG] = 3;//select speed
+    regs[DRIVEJOG] = 0;//select speed
     digitalWrite(DRIVEJOG1, HIGH);
      if(Millis - Millis1 > 800){
      regs[DRIVEJOG] = 4; 
@@ -407,7 +426,7 @@ void JOG_RIGHT(){
   Millis1 = millis();
   }
     if(Millis - Millis1 < 800){
-    regs[DRIVEJOG] = 3;//select speed
+    regs[DRIVEJOG] = 0;//select speed
     digitalWrite(DRIVEJOG1, HIGH);
      if(Millis - Millis1 > 800){
      regs[DRIVEJOG] = 5; 
@@ -451,17 +470,18 @@ void GO_TO_START(){
 }
 
 void SLOW_STEPL(){//removes backlash and prepares for start possition for a right to left run
-  if(LeadScrewCurrentPos>=0+LeadScrewReturnToLead){
+  if(DriveCurrentPos>=0+LeadScrewReturnToLead){
   if(Positioning2== HIGH){
     digitalWrite(INPOSITIONL, HIGH);
+    regs[INPOSITION]= 1;
     digitalWrite(RUNTOSTART, LOW);
     digitalWrite(Positioning1, LOW);
     digitalWrite(Positioning2, LOW);    
     } 
   }
-  if(LeadScrewCurrentPos>= 0-BackLash){
+  if(DriveCurrentPos>= LeadScrewReturnToLead-BackLash2){
   digitalWrite(Positioning1,HIGH);}
-  if(LeadScrewCurrentPos<= 0-BackLash){
+  if(DriveCurrentPos<= LeadScrewReturnToLead-BackLash2){
   digitalWrite(Positioning2,HIGH);
   digitalWrite(Positioning1,LOW);}
 
@@ -483,17 +503,18 @@ void SLOW_STEPL(){//removes backlash and prepares for start possition for a righ
 digitalWrite(StepPulse, PulseState);
 }
 void SLOW_STEPR(){//removes backlash and prepares for start possition for a left to right run
-  if(LeadScrewCurrentPos<=0-LeadScrewReturnToLead){
+  if(DriveCurrentPos<=0+LeadScrewReturnToLead){
   if(Positioning2== HIGH){
     digitalWrite(INPOSITIONR, HIGH);
+    regs[INPOSITION]= 2;
     digitalWrite(RUNTOSTART, LOW);
     digitalWrite(Positioning1, LOW);
     digitalWrite(Positioning2, LOW);
     } 
   }
-  if(LeadScrewCurrentPos<= 0+BackLash){
+  if(DriveCurrentPos<= LeadScrewReturnToLead+BackLash2){
   digitalWrite(Positioning1,HIGH);}
-  if(LeadScrewCurrentPos>= 0+BackLash){
+  if(DriveCurrentPos>= LeadScrewReturnToLead+BackLash2){
   digitalWrite(Positioning2,HIGH);
   digitalWrite(Positioning1,LOW);}
 
@@ -523,11 +544,19 @@ void COMS(){
    //READS
    sppsr = regs[PPR];
    BackLash = regs[BACKLASH];
+   LeadScrewReturnToLead = regs[TOOLLEAD];
    //WRITES
    regs[SPINDLE_RPM] = SpindleRPM;
+   regs[LEADSCREWPOS] = DriveCurrentPo
+   regs[SPINDLE_DEG] = SpindlePositionABS100 / 284;
+   regs[TOOLPOSITION] = LeadScrewCurrentPos;
+
+   
    regs[total_packets] = NO_OF_PACKET;             //Total number of packet, here is 2
    regs[total_requests] = master.total_requests(); //Update all requested packets. Take a look on ModbusXT.h
    regs[total_failed] = master.total_failed();     //Update all failed packet
+   regs[LEFTMAXWRITE] = regs[LEFTMAX];
+   regs[RIGHTMAXWRITE] = regs[RIGHTMAX];
 
   //update transfer rate and transfer delay
   if ( (sm-dm) > 1000) //update 1s
@@ -538,5 +567,3 @@ void COMS(){
      regs[transfer_delay] = (unsigned int) ((NO_OF_PACKET*100000UL)/regs[transfer_rate]);
    }
 }
-  
-  
